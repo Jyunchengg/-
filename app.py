@@ -19,15 +19,14 @@ if "orders" not in st.session_state:
 if "paste_content" not in st.session_state:
     st.session_state.paste_content = ""
 
-
 # ==================== 解析函數 ====================
 def parse_text(text: str) -> dict:
     """解析多客戶 LINE 貨單文字，回傳 {顧客: {品項: {"qty": , "unit": }, ...}}"""
     if not text or not text.strip():
         return {}
 
-    # 支援單位（kg 會正規化成公斤）
-    units = ["斤", "件", "把", "盒", "包", "支", "顆", "公斤", "kg", "KG"]
+    # 支援單位（新增「板」給豆腐等常見用法，kg 會正規化成公斤）
+    units = ["斤", "件", "把", "盒", "包", "支", "顆", "公斤", "板", "kg", "KG"]
     unit_pattern = "|".join(re.escape(u) for u in units)
 
     # 常見客戶關鍵字（可自行擴充）
@@ -37,6 +36,14 @@ def parse_text(text: str) -> dict:
         "三重", "蘆洲", "汐止", "樹林", "鶯歌"
     ]
 
+    def _is_separator_line(s: str) -> bool:
+        """判斷是否為純分隔符號行（如 ——————、------、===== 等）"""
+        if not s or not s.strip():
+            return True
+        # 移除常見分隔符號與空白後，若剩餘長度為 0 → 視為分隔線
+        cleaned = re.sub(r'[\s\-\—\_\=\*\u2014\u2015·•。・]+', '', s)
+        return len(cleaned) == 0
+
     parsed = {}
     current_customer = None
 
@@ -44,19 +51,75 @@ def parse_text(text: str) -> dict:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
     for line in lines:
-        # ---- 1. 偵測客戶名稱 ----
+        if _is_separator_line(line):
+            # 分隔線：不要切換客戶，也不要當成品項，直接跳過
+            continue
+
+        # ---- 優先嘗試解析為「品項」（必須在客戶偵測之前！）----
+        # 這樣「山藥條半支」這類「無阿拉伯數字但有中文數量」的行才不會被誤判為客戶名稱
+        if current_customer is not None:
+            qty = None
+            unit_raw = None
+            match_pos = None
+
+            # 1. 先試阿拉伯數字（最常見）
+            arabic_match = re.search(
+                r"(\d+(?:\.\d+)?)\s*(" + unit_pattern + r")",
+                line,
+                re.IGNORECASE
+            )
+            if arabic_match:
+                qty = float(arabic_match.group(1))
+                unit_raw = arabic_match.group(2)
+                match_pos = (arabic_match.start(), arabic_match.end())
+            else:
+                # 2. 再試「半」+單位（處理「山藥條半支」「半斤」這類中文數量）
+                half_match = re.search(
+                    r"半\s*(" + unit_pattern + r")",
+                    line,
+                    re.IGNORECASE
+                )
+                if half_match:
+                    qty = 0.5
+                    unit_raw = half_match.group(1)
+                    match_pos = (half_match.start(), half_match.end())
+
+            if qty is not None and unit_raw is not None:
+                unit = "公斤" if unit_raw.lower() in ("kg", "公斤") else unit_raw
+
+                # 取出品項名稱（把數量+單位那段移除）
+                start, end = match_pos
+                item_part = (line[:start] + line[end:]).strip()
+
+                # 清理開頭的垃圾符號，保留括號備註（如「牛番茄(大顆)」）
+                item = re.sub(r"^[\s:：\-–—,\.。，、\(\（]+", "", item_part).strip()
+
+                if item:
+                    parsed.setdefault(current_customer, []).append(
+                        {"item": item, "qty": qty, "unit": unit}
+                    )
+                continue   # 已成功解析為品項，不要再往下判斷客戶
+
+        # ---- 如果不是品項，才判斷這一行是否為客戶名稱 ----
         detected = None
 
-        # 優先用已知關鍵字
-        for cust in known_customers:
-            if cust in line:
-                detected = cust
-                break
+        # 強訊號：用書名號包住的客戶名稱 《麗媽內湖陽光店》
+        cust_match = re.search(r'《\s*(.+?)\s*》', line)
+        if cust_match:
+            detected = cust_match.group(1).strip()
+        else:
+            # 常見關鍵字匹配
+            for cust in known_customers:
+                if cust in line:
+                    detected = cust
+                    break
 
-        # 如果這一行完全沒有數字 → 視為自訂客戶名稱（非常實用）
-        if detected is None and not re.search(r"\d", line):
-            if 1 < len(line) <= 20:  # 避免過長亂字
-                detected = line
+        if detected is None:
+            # 彈性支援：完全沒有阿拉伯數字 + 含有中文 + 長度合理 + 不是純符號
+            if not re.search(r"\d", line) and re.search(r'[\u4e00-\u9fff]', line):
+                symbol_count = len(re.findall(r'[^\u4e00-\u9fff\w]', line))
+                if len(line) <= 25 and symbol_count / max(len(line), 1) < 0.65:
+                    detected = line
 
         if detected:
             current_customer = detected
@@ -64,36 +127,9 @@ def parse_text(text: str) -> dict:
                 parsed[current_customer] = []
             continue
 
-        # ---- 2. 不是客戶 → 嘗試解析品項 ----
-        if current_customer is None:
-            continue
+        # 既不是品項、也不是客戶 → 忽略這行
 
-        # 尋找「數字 + 單位」
-        match = re.search(
-            r"(\d+(?:\.\d+)?)\s*(" + unit_pattern + r")",
-            line,
-            re.IGNORECASE
-        )
-        if not match:
-            continue
-
-        qty = float(match.group(1))
-        unit_raw = match.group(2)
-
-        # 正規化單位
-        unit = "公斤" if unit_raw.lower() in ("kg", "公斤") else unit_raw
-
-        # 取出品項名稱（數字+單位前後的文字）
-        item_part = (line[: match.start()] + line[match.end():]).strip()
-
-        # 清理品項：去掉多餘符號，但保留中英文數字
-        item = re.sub(r"^[\s:：\-–—,\.。，、]+|[\s:：\-–—,\.。，、]+$", "", item_part)
-        item = item.strip()
-
-        if item:
-            parsed[current_customer].append({"item": item, "qty": qty, "unit": unit})
-
-    # ---- 3. 同一客戶內相同品項加總 ----
+    # ---- 同一客戶內相同品項加總 ----
     final = {}
     for cust, entries in parsed.items():
         agg = {}
@@ -106,7 +142,6 @@ def parse_text(text: str) -> dict:
         final[cust] = agg
 
     return final
-
 
 # ==================== 標題與提示 ====================
 st.title("菜市場貨單小幫手 ～ 旖旎統整中")

@@ -15,6 +15,10 @@ st.set_page_config(
 if "orders" not in st.session_state:
     st.session_state.orders = {}  # {顧客: {品項: {"qty": float, "unit": str}, ...}}
 
+# 用來控制輸入框內容（與 widget key 分離，避免直接寫入 widget 的 session_state key 導致 StreamlitAPIException）
+if "paste_content" not in st.session_state:
+    st.session_state.paste_content = ""
+
 
 # ==================== 解析函數 ====================
 def parse_text(text: str) -> dict:
@@ -135,9 +139,10 @@ st.subheader("📝 貼上客人 LINE 貨單文字")
 
 input_text = st.text_area(
     label="",
+    value=st.session_state.paste_content,
     placeholder="例如：\n內湖鼎\n紅K 8斤\n高麗菜 6件\n\n文德店\n玉米筍 70盒\n軟鴨血 10顆",
     height=220,
-    key="input_text",
+    key="paste_area",   # 使用獨立的 widget key，內容值用 paste_content 控制
     help="可一次貼多筆不同客戶的貨單"
 )
 
@@ -176,6 +181,7 @@ if example_btn:
             else:
                 st.session_state.orders[cust][item] = info.copy()
     st.success("已載入範例資料！")
+    st.session_state.paste_content = ""  # 載入範例後也清空輸入區
     st.rerun()
 
 # 解析並加入
@@ -194,8 +200,8 @@ if parse_btn:
                     else:
                         st.session_state.orders[cust][item] = info.copy()
             st.success(f"✅ 已成功解析並加入 {len(new_parsed)} 位客戶的資料！")
-            # 清空輸入框（下次 rerun 會更新）
-            st.session_state.input_text = ""
+            # 清空輸入框（使用獨立的值變數 + rerun 安全清除）
+            st.session_state.paste_content = ""
             st.rerun()
         else:
             st.warning("⚠️ 沒找到可解析的內容。請確認格式是否包含「品項 + 數量 + 單位」，並有客戶名稱。")
@@ -205,6 +211,7 @@ if parse_btn:
 # 清除所有
 if clear_btn:
     st.session_state.orders = {}
+    st.session_state.paste_content = ""  # 同時清空輸入框
     st.success("已清除所有資料！")
     st.rerun()
 
